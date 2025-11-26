@@ -21,10 +21,27 @@ const bool    ENABLE_FRONT = true;
 const uint8_t NUM_FRONT = 4;
 const uint8_t FRONT_PINS[NUM_FRONT] = {6, 7, 8, 10}; // VL, VLI, VRI, VR
 
-// Blindspot / Totwinkel (nur Fahrmodus, keine Pieperei hier)
+// Blindspot / Totwinkel (nur Fahrmodus)
 const bool    ENABLE_BLINDSPOT = true;
 const uint8_t NUM_BLIND = 2;
 const uint8_t BLIND_PINS[NUM_BLIND] = {11, 12}; // TL, TR
+
+// Optional: LED-Ausgänge für optisches Signal (eine pro Seite)
+const uint8_t BLIND_LED_PINS[NUM_BLIND] = {A0, A1}; // anpassen wie gewünscht
+
+// Schwellen für Totwinkel-Entscheidung (in korrigierten cm!)
+const float BLIND_ENTER_CM = 300.0;  // ab hier: "im Totwinkel" (rein)
+const float BLIND_EXIT_CM  = 350.0;  // erst ab hier wieder frei (raus)
+
+// Hysteresezählung, um Flackern zu vermeiden
+const uint8_t BLIND_HIT_COUNT_ON   = 3;  // 3 Treffer -> aktiv
+const uint8_t BLIND_MISS_COUNT_OFF = 5;  // 5 Fehlmessungen -> aus
+
+// interner Totwinkel-Zustand
+bool     blindActive[NUM_BLIND]   = {false, false};
+uint8_t  blindHitCount[NUM_BLIND] = {0, 0};
+uint8_t  blindMissCount[NUM_BLIND]= {0, 0};
+
 
 // Buzzer-Pins (Transistor/MOSFET steuert 8E0 919 279)
 const uint8_t BUZZER_REAR_PIN  = 9;
@@ -55,6 +72,7 @@ const float ZONE_NEAR_MIN = 20.0;   // kleinste Zone beginnt bei 20 cm
 const float ZONE_NEAR_MAX = 40.0;
 const float ZONE_MID_MAX  = 80.0;
 const float ZONE_FAR_MAX  = 150.0;
+
 
 enum Zone {
   ZONE_FREE = 0,   // >150 cm oder ungültig
@@ -316,10 +334,12 @@ void setup() {
     }
   }
   if (ENABLE_BLINDSPOT) {
-    for (uint8_t i = 0; i < NUM_BLIND; i++) {
-      pinMode(BLIND_PINS[i], INPUT);
-    }
+  for (uint8_t i = 0; i < NUM_BLIND; i++) {
+    pinMode(BLIND_PINS[i], INPUT);
+    pinMode(BLIND_LED_PINS[i], OUTPUT);
+    digitalWrite(BLIND_LED_PINS[i], LOW);
   }
+}
 
   pinMode(BUZZER_REAR_PIN, OUTPUT);
   pinMode(BUZZER_FRONT_PIN, OUTPUT);

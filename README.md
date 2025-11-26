@@ -1,7 +1,5 @@
 # VAG-Ultraschallsensor-Interface (PDC + Totwinkel) für Arduino
 
-Dieses Projekt ermöglicht es, originale  (Volkswagen, Audi, Skoda, Seat – MQB & PQ35/PQ46 Generation) mit einem **Arduino-kompatiblen Board** auszulesen und wie in OEM-Fahrzeugen zu verwenden.
-
 Dieses Projekt ermöglicht es, originale **VAG-Ultraschallsensoren** (Volkswagen, Audi, Skoda, Seat – MQB & PQ35/PQ46 Generation) mit einem **Arduino-kompatiblen Board** auszulesen und wie in OEM-Fahrzeugen zu verwenden.
 Es unterstützt:
 

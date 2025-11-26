@@ -12,9 +12,31 @@
 
 // ---------------- Konfiguration ----------------
 
+#define SENS_HL 0;
+#define SENS_HL_PIN 2;
+#define SENS_HLI 1;
+#define SENS_HLI_PIN 3;
+#define SENS_HRI 2;
+#define SENS_HRI_PIN 4;
+#define SENS_HR 3;
+#define SENS_HR_PIN 5;
+
+#define SENS_VL 4;
+#define SENS_VL_PIN 6;
+#define SENS_VLI 5;
+#define SENS_VLI_PIN 7;
+#define SENS_VRI 6;
+#define SENS_VRI_PIN 8;
+#define SENS_VR 7;
+#define SENS_VR_PIN 10;
+
+
+
+
 // Rear PDC
 const uint8_t NUM_REAR  = 4;
 const uint8_t REAR_PINS[NUM_REAR] = {2, 3, 4, 5};   // HL, HLI, HRI, HR
+
 
 // Front PDC (optional: auf false setzen, wenn noch nicht vorhanden)
 const bool    ENABLE_FRONT = true;
@@ -22,7 +44,7 @@ const uint8_t NUM_FRONT = 4;
 const uint8_t FRONT_PINS[NUM_FRONT] = {6, 7, 8, 10}; // VL, VLI, VRI, VR
 
 // Blindspot / Totwinkel (nur Fahrmodus)
-const bool    ENABLE_BLINDSPOT = true;
+const bool    ENABLE_BLINDSPOT = false;
 const uint8_t NUM_BLIND = 2;
 const uint8_t BLIND_PINS[NUM_BLIND] = {11, 12}; // TL, TR
 
@@ -48,16 +70,16 @@ const uint8_t BUZZER_REAR_PIN  = 9;
 const uint8_t BUZZER_FRONT_PIN = 13;
 
 // pulseIn-Timing
-const unsigned long PULSE_TIMEOUT_US = 20000;  // max. 20 ms
-const unsigned long RING_DOWN_US     = 700;    // ~12 cm (alles darunter = Ring-Down)
-const unsigned long MAX_ECHO_US      = 18000;  // >3 m -> ungültig
+const unsigned long PULSE_TIMEOUT_US = 16000;  // max. 20 ms
+const unsigned long RING_DOWN_US     = 500;    // ~12 cm (alles darunter = Ring-Down)
+const unsigned long MAX_ECHO_US      = 10000;  // >2 m -> ungültig
 
 // Messparameter
-const uint8_t N_MEAS = 3;   // Einzelmessungen pro Sensor im Parkmodus
+const uint8_t N_MEAS = 5;   // Einzelmessungen pro Sensor im Parkmodus
 
 // Grund-Glättungsparameter
-const float ALPHA_BASE    = 0.25;
-const float MAX_STEP_BASE = 15.0;
+const float ALPHA_BASE    = 0.7;
+const float MAX_STEP_BASE = 30.0;
 
 // Pulsdauer -> grobe Roh-cm (vor Entzerrung)
 const float DIVISOR = 25.6;
@@ -97,6 +119,20 @@ Zone          buzzerFrontLastZone     = ZONE_FREE;
 
 const unsigned int BUZZER_FREQ_HZ = 3000;  // ca. PDC-Tonhöhe
 
+
+
+// Wie oft darf ein Sensor maximal "schießen"?
+// Guard-Zeit pro Sensor in Mikrosekunden (Ausschwingzeit + Reserve)
+const unsigned long SENSOR_GUARD_US = 15000;  // 15 ms als Startwert
+
+// pro Sensor den Zeitpunkt des letzten Pings merken
+unsigned long rearLastPingUs[NUM_REAR]   = {0,0,0,0};
+unsigned long frontLastPingUs[NUM_FRONT] = {0,0,0,0};
+unsigned long blindLastPingUs[NUM_BLIND] = {0,0};
+
+// zuletzt bekannte Zonen (für Buzzerberechnung)
+Zone rearLastZone[NUM_REAR] = {ZONE_FREE, ZONE_FREE, ZONE_FREE, ZONE_FREE};
+
 // -------------------------------------------------------------
 // Platzhalter: Parkmodus/Fahrmodus
 // -> später durch echte Signale (Rückwärtsgang, Geschwindigkeit) ersetzen
@@ -108,6 +144,31 @@ bool isParkMode() {
 
 bool isDriveMode() {
   return !isParkMode();
+}
+
+// Gibt einen Pointer auf die passende lastPingUs-Variable zum Pin zurück,
+// oder nullptr, wenn der Pin in keiner Liste gefunden wird.
+unsigned long* getLastPingUsPtrForPin(uint8_t pin) {
+  // Rear
+  for (uint8_t i = 0; i < NUM_REAR; i++) {
+    if (REAR_PINS[i] == pin) {
+      return &rearLastPingUs[i];
+    }
+  }
+  // Front
+  for (uint8_t i = 0; i < NUM_FRONT; i++) {
+    if (FRONT_PINS[i] == pin) {
+      return &frontLastPingUs[i];
+    }
+  }
+  // Blindspot
+  for (uint8_t i = 0; i < NUM_BLIND; i++) {
+    if (BLIND_PINS[i] == pin) {
+      return &blindLastPingUs[i];
+    }
+  }
+  // unbekannter Pin
+  return nullptr;
 }
 
 // -------------------------------------------------------------
@@ -127,6 +188,25 @@ void triggerSensor(uint8_t pin) {
 // Einzelmessung: Pulsdauer -> "Roh-cm"
 // -------------------------------------------------------------
 float singlePingCm(uint8_t pin) {
+  unsigned long nowUs = micros();
+
+  // passenden lastPingUs-Speicher für diesen Pin holen
+  unsigned long* lastPingPtr = getLastPingUsPtrForPin(pin);
+
+  // Wenn wir keinen Speicher zuordnen können → zur Sicherheit messen wir NICHT
+  if (lastPingPtr == nullptr) {
+    return -1.0;
+  }
+
+  // Guard-Zeit prüfen: ist die Ausschwingzeit schon vorbei?
+  if (nowUs - *lastPingPtr < SENSOR_GUARD_US) {
+    // zu früh: Sensor noch am Ausschwingen → keine neue Messung
+    return -1.0;
+  }
+
+  // Ab hier: wir dürfen messen → Zeitpunkt des Pings merken
+  *lastPingPtr = nowUs;
+
   triggerSensor(pin);
 
   unsigned long dur = pulseIn(pin, HIGH, PULSE_TIMEOUT_US);
@@ -151,7 +231,6 @@ float medianDistance(uint8_t pin) {
   for (uint8_t i = 0; i < N_MEAS; i++) {
     float d = singlePingCm(pin);
     if (d > 0.0) vals[valid++] = d;
-    delay(3);
   }
 
   if (valid == 0) return -1.0;
@@ -202,7 +281,7 @@ float applyZoneCorrection(float d) {
 // -------------------------------------------------------------
 float filterPdcValue(float &filteredValue, float rawCm) {
   if (rawCm < 0.0) {
-    return -1.0;
+    return filteredValue;
   }
 
   // 1. Kennlinie
@@ -215,15 +294,18 @@ float filterPdcValue(float &filteredValue, float rawCm) {
   float alphaLocal   = ALPHA_BASE;
   float maxStepLocal = MAX_STEP_BASE;
 
-  if (d <= ZONE_NEAR_MAX) {
-    alphaLocal   = 0.15;
-    maxStepLocal = 5.0;
-  } else if (d <= ZONE_MID_MAX) {
-    alphaLocal   = 0.25;
-    maxStepLocal = 10.0;
+  //zone des letzten bekannten wertes
+  Zone zone = getZoneFromDistance(filteredValue);
+
+  if (zone == ZONE_NEAR_MAX) {
+    alphaLocal   = 0.3;
+    maxStepLocal = 7.0;
+  } else if (zone == ZONE_MID_MAX) {
+    alphaLocal   = 0.45;
+    maxStepLocal = 15.0;
   } else {
-    alphaLocal   = 0.35;
-    maxStepLocal = 20.0;
+    alphaLocal   = 0.55;
+    maxStepLocal = 25.0;
   }
 
   // 4. Initialisierung
@@ -376,8 +458,6 @@ void loopParkMode() {
     if (d < 0.0) Serial.print(F("----"));
     else { Serial.print(d, 1); Serial.print(F(" cm")); }
     Serial.print(F("   "));
-
-    delay(10);  // Abstand zum nächsten Sensor
   }
 
   // ----- Vorn (optional 4 Sensoren) -----
@@ -397,8 +477,6 @@ void loopParkMode() {
       if (d < 0.0) Serial.print(F("----"));
       else { Serial.print(d, 1); Serial.print(F(" cm")); }
       Serial.print(F("   "));
-
-      delay(10);
     }
   }
 
@@ -431,7 +509,6 @@ void loopParkMode() {
 // -------------------------------------------------------------
 void loopDriveMode() {
   if (!ENABLE_BLINDSPOT) {
-    delay(50);
     return;
   }
 
@@ -484,11 +561,9 @@ void loopDriveMode() {
     Serial.print(F("  state="));
     Serial.print(blindActive[i] ? F("1") : F("0"));
     Serial.print(F("  "));
-    delay(10);
   }
 
   Serial.println();
-  delay(50);  // Totwinkel-Update-Rate ~20 Hz
 }
 
 // -------------------------------------------------------------

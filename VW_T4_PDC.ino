@@ -402,8 +402,12 @@ void loopParkMode() {
 }
 
 // -------------------------------------------------------------
-// Fahrmodus: nur Totwinkel-Sensoren (hier nur Debug-Ausgabe)
-// -> später kannst du hier LED-Streifen, CAN etc. ansteuern
+// Fahrmodus: einfache Totwinkelerkennung (ja/nein pro Seite)
+// - misst Abstand
+// - wendet die gleiche Kennlinie an
+// - vergleicht mit BLIND_ENTER_CM / BLIND_EXIT_CM
+// - zählt Treffer/Fehlmessungen für Hysterese
+// - setzt blindActive[0/1] und LED
 // -------------------------------------------------------------
 void loopDriveMode() {
   if (!ENABLE_BLINDSPOT) {
@@ -414,24 +418,57 @@ void loopDriveMode() {
   Serial.print(F("DriveMode BLIND: "));
 
   for (uint8_t i = 0; i < NUM_BLIND; i++) {
+    // einfache Einzelmessung reicht hier (Schnappschuss)
     float raw = singlePingCm(BLIND_PINS[i]);
-    float d   = applyPolynomialCorrection(raw); // optional Korrektur
-    if (d < 0.0) {
-      Serial.print(F("B"));
-      Serial.print(i);
-      Serial.print(F(": ---- "));
-    } else {
-      Serial.print(F("B"));
-      Serial.print(i);
-      Serial.print(F(": "));
-      Serial.print(d, 1);
-      Serial.print(F(" cm  "));
+    float d   = applyPolynomialCorrection(raw);  // gleiche Entzerrung wie PDC
+
+    bool inRange = false;
+
+    if (d > 0.0) {
+      // Objekt in sinnvoller Reichweite für Totwinkel?
+      if (d <= BLIND_ENTER_CM) {
+        inRange = true;
+      }
     }
+
+    // Hysterese-Logik
+    if (inRange) {
+      if (blindHitCount[i] < 255) blindHitCount[i]++;
+      blindMissCount[i] = 0;
+
+      if (!blindActive[i] && blindHitCount[i] >= BLIND_HIT_COUNT_ON) {
+        blindActive[i] = true;  // Zustand wird "gemerkt"
+      }
+    } else {
+      if (blindMissCount[i] < 255) blindMissCount[i]++;
+      blindHitCount[i] = 0;
+
+      if (blindActive[i] && blindMissCount[i] >= BLIND_MISS_COUNT_OFF) {
+        blindActive[i] = false; // erst nach mehreren "frei" wieder aus
+      }
+    }
+
+    // LED-Ausgabe (optisches Signal)
+    digitalWrite(BLIND_LED_PINS[i], blindActive[i] ? HIGH : LOW);
+
+    // Debug-Ausgabe
+    Serial.print(F("B"));
+    Serial.print(i);
+    Serial.print(F(": "));
+    if (d < 0.0) {
+      Serial.print(F("----"));
+    } else {
+      Serial.print(d, 1);
+      Serial.print(F(" cm"));
+    }
+    Serial.print(F("  state="));
+    Serial.print(blindActive[i] ? F("1") : F("0"));
+    Serial.print(F("  "));
     delay(10);
   }
 
   Serial.println();
-  delay(50);  // Totwinkel-Update-Rate
+  delay(50);  // Totwinkel-Update-Rate ~20 Hz
 }
 
 // -------------------------------------------------------------

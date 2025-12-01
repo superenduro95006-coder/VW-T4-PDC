@@ -9,6 +9,7 @@
 // =============================================================
 
 #include <Arduino.h>
+#include "MedianFilter.h"
 
 // ---------------- Konfiguration ----------------
 
@@ -20,18 +21,65 @@
 #define SENS_FL_PIN 6
 #define SENS_FLI_PIN 7
 #define SENS_FRI_PIN 8
-#define SENS_FR_PIN 10
+#define SENS_FR_PIN 9
 
-#define SENS_LBL_PIN 11
-#define SENS_RBL_PIN 12
+#define SENS_LBL_PIN 10
+#define SENS_RBL_PIN 16
 // Optional: LED-Ausgänge für optisches Signal (eine pro Seite)
 #define LED_LBL_PIN A0
 #define LED_RBL_PIN A1
 
 // Buzzer-Pins (Transistor/MOSFET steuert 8E0 919 279)
-#define BUZZ_R_PIN 9
-#define BUZZ_F_PIN 13
+#define BUZZ_R_PIN 14
+#define BUZZ_F_PIN 15
 
+#define PARK_ENABLE_PIN 15
+
+#define RX_LED_PIN 17
+
+
+const unsigned int BUZZER_FREQ_HZ = 3000;  // ca. PDC-Tonhöhe
+
+// Schwellen für Totwinkel-Entscheidung (in korrigierten cm!)
+const float BLIND_ENTER_CM = 300.0;  // ab hier: "im Totwinkel" (rein)
+const float BLIND_EXIT_CM  = 350.0;  // erst ab hier wieder frei (raus)
+
+// Hysteresezählung, um Flackern zu vermeiden
+const uint8_t BLIND_HIT_COUNT_ON   = 3;  // 3 Treffer -> aktiv
+const uint8_t BLIND_MISS_COUNT_OFF = 5;  // 5 Fehlmessungen -> aus
+
+
+// Pulsdauer -> grobe Roh-cm (vor Entzerrung)
+const float DIVISOR = 25.6;
+
+// pulseIn-Timing
+const unsigned long PULSE_TIMEOUT_US = 16000;  // max. 20 ms
+const unsigned long RING_DOWN_US     = 200;    // ~12 cm (alles darunter = Ring-Down)
+const unsigned long MAX_ECHO_US      = 10000;  // >2 m -> ungültig
+// Wie oft darf ein Sensor maximal "schießen"?
+// Guard-Zeit pro Sensor in Mikrosekunden (Ausschwingzeit + Reserve)
+const unsigned long SENSOR_GUARD_US = 12000;  // 15 ms als Startwert
+const unsigned long SENSOR_DWELL_US = 10000;  // 12 ms als Startwert
+
+
+
+// Median Messparameter
+const uint8_t N_MEAS = 5;   // Einzelmessungen pro Sensor im Parkmodus
+
+// Grund-Glättungsparameter
+const float ALPHA_BASE    = 0.7;
+const float MAX_STEP_BASE = 30.0;
+
+// Nichtlineare Distanzentzerrung (aus deinen 3 Messpunkten)
+/*
+const float POLY_A = -0.002303;
+const float POLY_B =  2.0655;
+const float POLY_C = -9.542;
+*/ 
+// Polynom aus den neuen Messwerten
+const float POLY_A = 0.00127600683f;
+const float POLY_B = 0.733338949f;
+const float POLY_C = 16.4056609f;
 
 
 enum Zone {
@@ -41,10 +89,17 @@ enum Zone {
   ZONE_NEAR = 3    // 20–40 cm
 };
 
+// Zonen-Definition
+const float ZONE_NEAR_MIN = 20.0;   // kleinste Zone beginnt bei 10 cm
+const float ZONE_NEAR_MAX = 40.0;
+const float ZONE_MID_MAX  = 80.0;
+const float ZONE_FAR_MAX  = 150.0;
+
 struct USSensor {
   uint8_t      pin; // Arduino-Pin für diesen Sensor
   float        filtered;    // zuletzt gefilterter/distanz-korrigierter Wert in cm
   unsigned long lastPingUs; // Zeit des letzten Triggerpulses (Guard-Zeit)
+  MedianFilter filter;
 };
 
 struct PdcSensor {
@@ -78,109 +133,45 @@ struct PDC {
   PdcSensor sensors[4];
   Buzzer buzzer;
   Zone zone;
+  unsigned long lastSensorPingUs; // Zeit der letzten Sensorenabrfrage - macht 
 };
 
 
 PDC rearPDC = PDC {
   4,
   {
-  {{SENS_RL_PIN, -1.0f, 0}, ZONE_FREE, "RL"},
-  {{SENS_RLI_PIN, -1.0f, 0}, ZONE_FREE, "RLI"},
-  {{SENS_RRI_PIN, -1.0f, 0}, ZONE_FREE, "RRI"},
-  {{SENS_RR_PIN, -1.0f, 0}, ZONE_FREE, "RR"}
+  {{SENS_RL_PIN, -1.0f, 0, MedianFilter(5, 100)}, ZONE_FREE, "RL"},
+  {{SENS_RLI_PIN, -1.0f, 0, MedianFilter(5, 100)}, ZONE_FREE, "RLI"},
+  {{SENS_RRI_PIN, -1.0f, 0, MedianFilter(5, 100)}, ZONE_FREE, "RRI"},
+  {{SENS_RR_PIN, -1.0f, 0, MedianFilter(5, 100)}, ZONE_FREE, "RR"}
   },
   {BUZZ_R_PIN, 0, false, ZONE_FREE},
-  ZONE_FREE
+  ZONE_FREE,
+  0
 };
 
-const bool    ENABLE_FRONT = true;
+const bool    ENABLE_FRONT = false;
 PDC frontPDC = PDC {
   4,
   {
-  {{SENS_FL_PIN,  -1.0f, 0}, ZONE_FREE, "FL"},
-  {{SENS_FLI_PIN,  -1.0f, 0}, ZONE_FREE, "FLI"},
-  {{SENS_FRI_PIN,  -1.0f, 0}, ZONE_FREE, "FRI"},
-  {{SENS_FR_PIN, -1.0f, 0}, ZONE_FREE, "FR"}
+  {{SENS_FL_PIN,  -1.0f, 0, MedianFilter(5, 100)}, ZONE_FREE, "FL"},
+  {{SENS_FLI_PIN,  -1.0f, 0, MedianFilter(5, 100)}, ZONE_FREE, "FLI"},
+  {{SENS_FRI_PIN,  -1.0f, 0, MedianFilter(5, 100)}, ZONE_FREE, "FRI"},
+  {{SENS_FR_PIN, -1.0f, 0, MedianFilter(5, 100)}, ZONE_FREE, "FR"}
   },
   {BUZZ_F_PIN, 0, false, ZONE_FREE},
-  ZONE_FREE
+  ZONE_FREE,
+  0
 };
 
-/*
-// Rear PDC
-PdcSensor rearSensors[NUM_REAR] = {
-  {{SENS_RL_PIN, -1.0f, 0}, ZONE_FREE, "RL"},
-  {{SENS_RLI_PIN, -1.0f, 0}, ZONE_FREE, "RLI"},
-  {{SENS_RRI_PIN, -1.0f, 0}, ZONE_FREE, "RRI"},
-  {{SENS_RR_PIN, -1.0f, 0}, ZONE_FREE, "RR"}
-};
-
-
-// Front PDC (optional: auf false setzen, wenn noch nicht vorhanden)
-
-PdcSensor frontSensors[NUM_FRONT] = {
-  {{SENS_FL_PIN,  -1.0f, 0}, ZONE_FREE, "FL"},
-  {{SENS_FLI_PIN,  -1.0f, 0}, ZONE_FREE, "FLI"},
-  {{SENS_FRI_PIN,  -1.0f, 0}, ZONE_FREE, "FRI"},
-  {{SENS_FR_PIN, -1.0f, 0}, ZONE_FREE, "FR"}
-};
-*/
 
 // Blindspot / Totwinkel (nur Fahrmodus)
 const bool    ENABLE_BLINDSPOT = false;
 const uint8_t NUM_BLIND = 2;
 BlindSensor blindSensors[NUM_BLIND] = {
-  {{SENS_LBL_PIN,  -1.0f, 0}, false, 0, 0, LED_LBL_PIN, "LBL"},
-  {{SENS_RBL_PIN, -1.0f, 0}, false, 0, 0, LED_RBL_PIN, "RBL"}
+  {{SENS_LBL_PIN,  -1.0f, 0, MedianFilter(5, 100)}, false, 0, 0, LED_LBL_PIN, "LBL"},
+  {{SENS_RBL_PIN, -1.0f, 0, MedianFilter(5, 100)}, false, 0, 0, LED_RBL_PIN, "RBL"}
 };
-
-
-
-
-// Schwellen für Totwinkel-Entscheidung (in korrigierten cm!)
-const float BLIND_ENTER_CM = 300.0;  // ab hier: "im Totwinkel" (rein)
-const float BLIND_EXIT_CM  = 350.0;  // erst ab hier wieder frei (raus)
-
-// Hysteresezählung, um Flackern zu vermeiden
-const uint8_t BLIND_HIT_COUNT_ON   = 3;  // 3 Treffer -> aktiv
-const uint8_t BLIND_MISS_COUNT_OFF = 5;  // 5 Fehlmessungen -> aus
-
-
-// pulseIn-Timing
-const unsigned long PULSE_TIMEOUT_US = 16000;  // max. 20 ms
-const unsigned long RING_DOWN_US     = 500;    // ~12 cm (alles darunter = Ring-Down)
-const unsigned long MAX_ECHO_US      = 10000;  // >2 m -> ungültig
-// Wie oft darf ein Sensor maximal "schießen"?
-// Guard-Zeit pro Sensor in Mikrosekunden (Ausschwingzeit + Reserve)
-const unsigned long SENSOR_GUARD_US = 15000;  // 15 ms als Startwert
-
-
-// Median Messparameter
-const uint8_t N_MEAS = 5;   // Einzelmessungen pro Sensor im Parkmodus
-
-// Grund-Glättungsparameter
-const float ALPHA_BASE    = 0.7;
-const float MAX_STEP_BASE = 30.0;
-
-// Pulsdauer -> grobe Roh-cm (vor Entzerrung)
-const float DIVISOR = 25.6;
-
-// Nichtlineare Distanzentzerrung (aus deinen 3 Messpunkten)
-const float POLY_A = -0.002303;
-const float POLY_B =  2.0655;
-const float POLY_C = -9.542;
-
-// Zonen-Definition
-const float ZONE_NEAR_MIN = 20.0;   // kleinste Zone beginnt bei 20 cm
-const float ZONE_NEAR_MAX = 40.0;
-const float ZONE_MID_MAX  = 80.0;
-const float ZONE_FAR_MAX  = 150.0;
-
-const unsigned int BUZZER_FREQ_HZ = 3000;  // ca. PDC-Tonhöhe
-
-// Buzzer-Zustand
-//Buzzer frontBuzzer = Buzzer{BUZZ_F_PIN, 0, false, ZONE_FREE};
-//Buzzer rearBuzzer = Buzzer{BUZZ_R_PIN, 0, false, ZONE_FREE};
 
 // -------------------------------------------------------------
 // Platzhalter: Parkmodus/Fahrmodus
@@ -188,7 +179,7 @@ const unsigned int BUZZER_FREQ_HZ = 3000;  // ca. PDC-Tonhöhe
 // -------------------------------------------------------------
 bool isParkMode() {
   // TODO: Rückwärtsgang / Geschwindigkeit einlesen
-  return true;   // aktuell immer Parkmodus aktiv
+  return true;  //digitalRead(PARK_ENABLE_PIN);   // aktuell immer Parkmodus aktiv
 }
 
 bool isDriveMode() {
@@ -323,6 +314,7 @@ float measureBlockedDistance(USSensor &s) {
 // Median über N_MEAS Messungen
 // -------------------------------------------------------------
 float medianDistance(USSensor &s) {
+  /*
   float vals[N_MEAS];
   uint8_t valid = 0;
 
@@ -343,10 +335,21 @@ float medianDistance(USSensor &s) {
       }
     }
   }
-
   return vals[valid / 2];
+  */
+
+  float d = measureDistance(s);
+  
+  if (d < 0.0) return -1.0;
+
+  s.filter.in((int)(d+.5));
+
+  return float(s.filter.out());
+
 }
 
+//measure twice - measurement is valid only if both value are equal
+//otherwise return -1
 float verifiedDistance(USSensor &s){
   uint8_t valid = 1;
 
@@ -407,7 +410,12 @@ float filterPdcValue(float rawCm, float filteredValue) {
   float maxStepLocal = MAX_STEP_BASE;
 
   //zone des letzten bekannten wertes
+  Zone lastZone = getZoneFromDistance(filteredValue);
   Zone zone = getZoneFromDistance(d);
+
+  //each zone has to be passed - jumps in zones are false readings (nearby noise)
+  if(lastZone == ZONE_NEAR && abs(zone-lastZone) > 1)
+    return filteredValue;
 
   if (zone == ZONE_NEAR_MAX) {
     alphaLocal   = 0.3;
@@ -423,7 +431,6 @@ float filterPdcValue(float rawCm, float filteredValue) {
   // 4. Initialisierung
   if (filteredValue < 0.0) {
     filteredValue = d;
-    Serial.println("early out ");  
     return d;
   }
 
@@ -440,7 +447,7 @@ float filterPdcValue(float rawCm, float filteredValue) {
 
 //reads distance and applies filter to readings
 void updatePdcSensor(PdcSensor &s) {
-  float raw = verifiedDistance(s.sensor);//medianDistance(s.sensor);
+  float raw = medianDistance(s.sensor); //verifiedDistance(s.sensor);
   s.sensor.filtered   = filterPdcValue(raw, s.sensor.filtered);
   s.zone   = getZoneFromDistance(s.sensor.filtered);
 }
@@ -449,9 +456,14 @@ void updatePdc(PDC &pdc) {
   Zone zOverall  = ZONE_FREE;
 
   for (uint8_t i = 0; i < pdc.numSensors; i++) {
-    
+    //wait for next Sensor read
+    if(micros() - pdc.lastSensorPingUs < SENSOR_DWELL_US) {
+      delayMicroseconds(SENSOR_DWELL_US - (millis() - pdc.lastSensorPingUs));
+    }
+
     PdcSensor &sensor = pdc.sensors[i];
     updatePdcSensor(sensor);
+    pdc.lastSensorPingUs = sensor.sensor.lastPingUs;
 
     if (sensor.zone > zOverall) zOverall = sensor.zone;
 
@@ -614,6 +626,7 @@ void setup() {
   }
 }
 
+  pinMode(PARK_ENABLE_PIN, INPUT);
   pinMode(rearPDC.buzzer.pin, OUTPUT);
   pinMode(frontPDC.buzzer.pin, OUTPUT);
   muteBuzzer(rearPDC.buzzer);
@@ -622,6 +635,23 @@ void setup() {
   Serial.println(F("Version P+ gestartet (4x hinten, optional 4x vorn, optional 2x Totwinkel)"));
 }
 
+
+long getIntervallFromDZone(Zone z) {
+  switch (z) {
+    case ZONE_FAR:
+      return 1000;
+    case ZONE_MID:
+      return 300;
+    case ZONE_NEAR:
+      return 50;
+    default:
+      return 1000000;
+  }
+}
+
+// Variables will change:
+int ledState = LOW;  // ledState used to set the LED
+unsigned long previousMillis = 0; 
 // -------------------------------------------------------------
 // Hauptloop: Moduswahl
 // -------------------------------------------------------------
@@ -634,6 +664,26 @@ void loop() {
     resetPDC(rearPDC);
     resetPDC(frontPDC);
     loopDriveMode();
+  }
+  delayMicroseconds(10000);
+
+  long interval = getIntervallFromDZone(rearPDC.zone);
+
+  unsigned long currentMillis = millis();
+
+  if (currentMillis - previousMillis >= interval) {
+    // save the last time you blinked the LED
+    previousMillis = currentMillis;
+
+    // if the LED is off turn it on and vice-versa:
+    if (ledState == LOW) {
+      ledState = HIGH;
+    } else {
+      ledState = LOW;
+    }
+
+    // set the LED with the ledState of the variable:
+    digitalWrite(RX_LED_PIN, ledState);
   }
 }
 
